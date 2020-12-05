@@ -1,39 +1,67 @@
 ////////////////////////////////////////////////////////////////
-/* Lab 6 - Part 1
+/* Lab 10
  * Author: Daniel Dole-Muinos
- * Description: SRAM Audio Mixing using Codec*/
+ * Description: Sampler*/
 ////////////////////////////////////////////////////////////////
 //Includes//////////////////////////////////////////////////////
 #include <F28x_Project.h>
 #include "SRAM_Driver.h"
 #include "AIC23.h"
 #include <math.h>
+#include "LCD_Driver.h"
 
 #define     delay_200ms()   for(volatile long j=0; j < 1400000; j++)
 
 #define     SAMP_RATE       48000.0
+#define     RESOLUTION      0.000738435546875
+#define     ADC_MIN         0
+#define     ADC_MAX         4095
+#define     SAMP_MIN        10000
+#define     SAMP_MAX        0x3ffff //262143
+#define     LEN_MIN         5
+#define     LEN_MAX         200000
 
+//NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
 void InitMcBSPb();
 void InitSPIA();
 void InitAIC23();
 void InitAIC23_16bit();
 void IO_GPIO_Init();
 
+interrupt void Timer1_isr(void);
+void InitTimer1(void);
+void InitAdca(void);
+void InitAdcb(void);
+
 interrupt void McBSP_RX_ISR(void);
 
 volatile Uint16 flag = 0, mixenable = 0;
 
 volatile int16 LS,RS,throwaway,samp_ready,play_samp,play_ready,sample,prevsample,mixsample;
-volatile Uint32 sptr = 0, pptr = 0, pptr_start = 10000, pptr_end = 50000;
+volatile Uint32 sptr = 0, pptr = 0, pptr_start = 10000, pptr_length = 80000, pptr_end = 50000;
 volatile float fade_factor = 0.0f;
+volatile float fade_time = 0.1f;
 
-int main(){
-    volatile float fade_time = 0.1f;
+//ADC:
+Uint16 AdcData0 = 0,AdcData1 = 0;
+int decRes,ones,tenths,hundredths;
+
+//LCD Commands:
+Uint16  nextLine     = 0xC0;
+Uint16  clear        = 0x01;
+Uint16  home         = 0x02;
+
+//DEBUG:
+volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
+
+ int main(void){
     volatile float fade_delta = 1.0f/(fade_time*SAMP_RATE);
     volatile float fade_in_mark  = pptr_start + fade_time * SAMP_RATE;
-    volatile float fade_out_mark = pptr_end - pptr_start - fade_time * SAMP_RATE;
+    volatile float fade_out_mark = pptr_start + pptr_length - fade_time * SAMP_RATE;
 
     InitSysCtrl();      // Set SYSCLK to 200 MHz, disables watchdog timer, turns on peripheral clocks
+
+    LCD_init();         // Initialize LCD output
 
     DINT;               // Disable CPU interrupts on startup
 
@@ -45,10 +73,14 @@ int main(){
 
     EALLOW;             // EALLOW for rest of program (unless later function disables it)
 
+    InitTimer1();       // Initialize CPU timer 1
+
+    InitAdca();         // Initialize ADC A channel 0
+    InitAdcb();         // Initialize ADC B channel 3
+
     PieVectTable.MCBSPB_RX_INT = &McBSP_RX_ISR;
     IER |= M_INT6;
     PieCtrlRegs.PIEIER6.bit.INTx7 = 1;          //Enable McBSPBRx interrupt
-    EnableInterrupts();
 
     SRAM_GPIO_Init();
     IO_GPIO_Init();
@@ -59,25 +91,47 @@ int main(){
 
     SRAM_CLEAR();
 
+    EnableInterrupts();
+
     while(1) {
         if(play_ready) {
+            //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
+            pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+
+            pptr_length = (((AdcData1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+            pptr_end = (pptr_start + pptr_length);
+
+            if(pptr >= 0x40000 || pptr >= pptr_end)
+            {
+                if(flag == 3) {
+                    //GpioDataRegs.GPADAT.bit.GPIO5 = 1; //Turn LED[1] off
+                    pptr = pptr_start;
+                    fade_factor = 0.0f;
+                    //DEBUG:
+                    fade_count_pos = 0;
+                    fade_count_neg = 0;
+                }
+            }
             play_samp = SRAM_READ(pptr);
+            pptr++;
 
             fade_delta      = 1.0f/(fade_time*SAMP_RATE);
             fade_in_mark    = pptr_start + fade_time * SAMP_RATE;
-            fade_out_mark   = pptr_end - fade_time * SAMP_RATE;
+            fade_out_mark   = pptr_start + pptr_length - fade_time * SAMP_RATE;
 
-            if(pptr < fade_in_mark)
+            if(pptr <= fade_in_mark)
             {
                 fade_factor += fade_delta;
+                fade_count_pos++;
             }
 
             if(pptr > fade_out_mark)
             {
                 fade_factor -= fade_delta;
+                fade_count_neg++;
             }
 
-            play_samp = (int16)(play_samp * fade_factor);
+            play_samp = (int16)(play_samp);
 
             //HANNING BROKE SOUND :(
             //hannoutput = 0.5f * (1 - cosf(2.0f * M_PI * (pptr - pptr_start) / (((pptr_end-pptr_start) - 1))));
@@ -166,6 +220,74 @@ int main(){
     }
 }
 
+void InitAdca(void) {
+    AdcaRegs.ADCCTL2.bit.PRESCALE = 6;                                 // Set ADCCLK to SYSCLK/4
+    AdcSetMode(ADC_ADCA, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE); // Initializes ADCA to 12-bit and single-ended mode. Performs internal calibration
+    AdcaRegs.ADCCTL1.bit.ADCPWDNZ = 1;                                 // Powers up ADC
+    DELAY_US(1000);                                                    // Delay to allow ADC to power up
+    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 0;                                 // Sets SOC0 to channel 0 -> pin ADCINA0
+    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 14;                                // Sets sample and hold window -> must be at least 1 ADC clock long
+}
+
+void InitAdcb(void) {
+    AdcbRegs.ADCCTL2.bit.PRESCALE = 6;                                 // Set ADCCLK to SYSCLK/4
+    AdcSetMode(ADC_ADCB, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE); // Initializes ADCA to 12-bit and single-ended mode. Performs internal calibration
+    AdcbRegs.ADCCTL1.bit.ADCPWDNZ = 1;                                 // Powers up ADC
+    DELAY_US(1000);                                                    // Delay to allow ADC to power up
+    AdcbRegs.ADCSOC0CTL.bit.CHSEL = 3;                                 // Sets SOC0 to channel 0 -> pin ADCINA0
+    AdcbRegs.ADCSOC0CTL.bit.ACQPS = 14;                                // Sets sample and hold window -> must be at least 1 ADC clock long
+}
+
+void InitTimer1(void) {
+    InitCpuTimers();                            // Initialize all timers to known state
+    ConfigCpuTimer(&CpuTimer1, 200, 500000);    // Configure CPU timer 1. 200 -> SYSCLK in MHz, 500000 -> period in usec. NOTE: Does NOT start timer
+    PieVectTable.TIMER1_INT = &Timer1_isr;      // Assign timer 1 ISR to PIE vector table
+    IER |= M_INT13;                             // Enable INT13 in CPU
+    CpuTimer1.RegsAddr->TCR.bit.TSS = 0;        // Start timer 1
+}
+
+interrupt void Timer1_isr(void) {
+    AdcaRegs.ADCSOCFRC1.bit.SOC0 = 1;          // Force conversion on channel 0
+    AdcData0 = AdcaResultRegs.ADCRESULT0;    // Read ADC result into global variable
+    GpioDataRegs.GPATOGGLE.bit.GPIO31 = 1;  // Toggle blue LED
+    AdcbRegs.ADCSOCFRC1.bit.SOC0 = 1;          // Force conversion on channel 1
+    AdcData1 = AdcbResultRegs.ADCRESULT0;    // Read ADC result into global variable
+
+//    decRes = AdcData0 * RESOLUTION * 100;
+//
+//    ones = decRes/100;
+//    tenths = (decRes%100)/10;
+//    hundredths = (decRes%100)%10;
+//
+//    ones += 0x30;
+//    tenths += 0x30;
+//    hundredths += 0x30;
+//
+//    LCD_SEND_COMMAND(&clear);
+//    LCD_SEND_STRING("Voltage: ");
+//    LCD_SEND_CHAR((char *)&ones);
+//    LCD_SEND_CHAR(".");
+//    LCD_SEND_CHAR((char *)&tenths);
+//    LCD_SEND_CHAR((char *)&hundredths);
+//
+//    decRes = AdcData1 * RESOLUTION * 100;
+//
+//    ones = decRes/100;
+//    tenths = (decRes%100)/10;
+//    hundredths = (decRes%100)%10;
+//
+//    ones += 0x30;
+//    tenths += 0x30;
+//    hundredths += 0x30;
+//
+//    LCD_SEND_COMMAND(&nextLine);
+//    LCD_SEND_STRING("Voltage: ");
+//    LCD_SEND_CHAR((char *)&ones);
+//    LCD_SEND_CHAR(".");
+//    LCD_SEND_CHAR((char *)&tenths);
+//    LCD_SEND_CHAR((char *)&hundredths);
+}
+
  interrupt void McBSP_RX_ISR(void) {
      // Check ISR rate w DAD
      //GpioDataRegs.GPATOGGLE.bit.GPIO11 = 1;
@@ -175,15 +297,6 @@ int main(){
              GpioDataRegs.GPADAT.bit.GPIO4 = 1; //Turn LED[0] off
              flag = 0;   //end recording
              sptr = 0;
-         }
-     }
-     if(pptr >= 0x40000 || pptr >= pptr_end)
-     {
-         if(flag == 3) {
-             GpioDataRegs.GPADAT.bit.GPIO5 = 1; //Turn LED[1] off
-             sptr = 0;
-             pptr = pptr_start;
-             fade_factor = 0.0f;
          }
      }
 
@@ -211,7 +324,6 @@ int main(){
                  McbspbRegs.DXR2.all = play_samp;
                  McbspbRegs.DXR1.all = play_samp;
                  play_ready = 1;
-                 pptr++;
              }
      }
      PieCtrlRegs.PIEACK.all = PIEACK_GROUP6;

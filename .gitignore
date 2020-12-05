@@ -156,3 +156,8 @@ targetConfigs/readme.txt
 targetConfigs/TMS320F28379D.ccxml
 lab6_quiz.c
 2837xD_GSRAM_COMBINED_lnk_cpu1.cmd
+Debug/GrainField 5000_added_adc.d
+Debug/GrainField 5000.d
+Debug/GrainField 5000.obj
+GrainField 5000_working core.c
+GrainField 5000_backup.c
