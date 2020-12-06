@@ -19,7 +19,7 @@
 #define     SAMP_MIN        10000
 #define     SAMP_MAX        0x3ffff //262143
 #define     LEN_MIN         5
-#define     LEN_MAX         200000
+#define     LEN_MAX         250000
 
 //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
 void InitMcBSPb();
@@ -38,7 +38,7 @@ interrupt void McBSP_RX_ISR(void);
 volatile Uint16 flag = 0, mix_enable = 0, rev_enable = 0;
 
 volatile int16 LS,RS,throwaway,samp_ready,play_samp,play_ready,sample,prevsample,mixsample;
-volatile Uint32 sptr = 0, pptr = 0, pptr_start = 10000, pptr_length = 80000, pptr_end = 50000;
+volatile Uint32 sptr = 0, pptr = 0, pptr_start = 10000, pptr_length = 40000, pptr_end = 50000, pptr_half = 30000;
 volatile float fade_factor = 0.0f;
 volatile float fade_time = 0.1f;
 
@@ -117,10 +117,6 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
         }
 
         if(play_ready) {
-            pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
-            pptr_length = (((AdcData1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
-            pptr_end = (pptr_start + pptr_length);
-
             //Reverse mode (playback starts from pptr_end to pptr_start)
             if(rev_enable) {
                 if(pptr <= pptr_start && flag == 3)
@@ -131,40 +127,49 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
                     //DEBUG:
                     fade_count_pos = 0;
                     fade_count_neg = 0;
+                    //
+//                    pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+//                    pptr_length = (((AdcData1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+//                    pptr_end = (pptr_start + pptr_length);
+//                    pptr_half = pptr_start + (pptr_length/2);
                 }
                 play_samp = SRAM_READ(pptr--);
             }
+            //Forward mode
             else {
                 if((pptr >= 0x40000 || pptr >= pptr_end) && flag == 3)
                 {
+                    pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+                    pptr_length = (((AdcData1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+                    pptr_end = (pptr_start + pptr_length);
+                    pptr_half = pptr_start + (pptr_length/2);
+                    fade_delta      = 1.0f/(pptr_half);
                     //GpioDataRegs.GPADAT.bit.GPIO5 = 1; //Turn LED[1] off
                     pptr = pptr_start;
                     fade_factor = 0.0f;
                     //DEBUG:
                     fade_count_pos = 0;
                     fade_count_neg = 0;
+                    //
+                }
+                if(pptr < pptr_half)
+                {
+                    fade_factor += fade_delta;
+                    fade_count_pos++;
+                }
+                if(pptr >= pptr_half)
+                {
+                    fade_factor -= fade_delta;
+                    fade_count_neg++;
                 }
                 play_samp = SRAM_READ(pptr++);
             }
             //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
 
-//            fade_delta      = 1.0f/(fade_time*SAMP_RATE);
-//            fade_in_mark    = pptr_start + fade_time * SAMP_RATE;
-//            fade_out_mark   = pptr_start + pptr_length - fade_time * SAMP_RATE;
-//
-//            if(pptr <= fade_in_mark)
-//            {
-//                fade_factor += fade_delta;
-//                fade_count_pos++;
-//            }
-//
-//            if(pptr > fade_out_mark)
-//            {
-//                fade_factor -= fade_delta;
-//                fade_count_neg++;
-//            }
-
-            play_samp = (int16)(play_samp);
+            //fade_delta      = 1.0f/(pptr_half);
+            //fade_in_mark    = pptr_start + fade_time * SAMP_RATE;
+            //fade_out_mark   = pptr_start + pptr_length - fade_time * SAMP_RATE;
+            play_samp = (int16)(play_samp*fade_factor);
 
             //HANNING BROKE SOUND :(
             //hannoutput = 0.5f * (1 - cosf(2.0f * M_PI * (pptr - pptr_start) / (((pptr_end-pptr_start) - 1))));
@@ -239,6 +244,10 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
                 GpioDataRegs.GPADAT.bit.GPIO5 = 0; //Turn LED[1] on
                 // set ptr to beginning
                 if(flag == 0) {
+                    pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+                    pptr_length = (((AdcData1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+                    pptr_end = (pptr_start + pptr_length);
+                    pptr_half = pptr_start + (pptr_length/2);
                     pptr = pptr_start;
                     // begin playback
                     flag = 3;
