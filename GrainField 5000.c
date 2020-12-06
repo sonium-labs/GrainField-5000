@@ -35,7 +35,7 @@ void InitAdcb(void);
 
 interrupt void McBSP_RX_ISR(void);
 
-volatile Uint16 flag = 0, mixenable = 0;
+volatile Uint16 flag = 0, mix_enable = 0, rev_enable = 0;
 
 volatile int16 LS,RS,throwaway,samp_ready,play_samp,play_ready,sample,prevsample,mixsample;
 volatile Uint32 sptr = 0, pptr = 0, pptr_start = 10000, pptr_length = 80000, pptr_end = 50000;
@@ -54,7 +54,7 @@ Uint16  home         = 0x02;
 //DEBUG:
 volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
 
- int main(void){
+  int main(void){
     volatile float fade_delta = 1.0f/(fade_time*SAMP_RATE);
     volatile float fade_in_mark  = pptr_start + fade_time * SAMP_RATE;
     volatile float fade_out_mark = pptr_start + pptr_length - fade_time * SAMP_RATE;
@@ -74,7 +74,6 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
     EALLOW;             // EALLOW for rest of program (unless later function disables it)
 
     InitTimer1();       // Initialize CPU timer 1
-
     InitAdca();         // Initialize ADC A channel 0
     InitAdcb();         // Initialize ADC B channel 3
 
@@ -94,16 +93,50 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
     EnableInterrupts();
 
     while(1) {
-        if(play_ready) {
-            //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
-            pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+        //MODE CHECKS
+        //DIP Switch Check//////////////////////////////////
+        //SW0 - Mix Enable
+        if(GpioDataRegs.GPADAT.bit.GPIO0 == 0) {
+            mix_enable = 1;
+            GpioDataRegs.GPADAT.bit.GPIO7 = 0;
 
+        }
+        else {
+            mix_enable = 0;
+            GpioDataRegs.GPADAT.bit.GPIO7 = 1;
+        }
+        //SW1 - Reverse Mode
+        if(GpioDataRegs.GPADAT.bit.GPIO1 == 0) {
+            rev_enable = 1;
+            GpioDataRegs.GPADAT.bit.GPIO8 = 0;
+
+        }
+        else {
+            rev_enable = 0;
+            GpioDataRegs.GPADAT.bit.GPIO8 = 1;
+        }
+
+        if(play_ready) {
+            pptr_start  = (((AdcData0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
             pptr_length = (((AdcData1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
             pptr_end = (pptr_start + pptr_length);
 
-            if(pptr >= 0x40000 || pptr >= pptr_end)
-            {
-                if(flag == 3) {
+            //Reverse mode (playback starts from pptr_end to pptr_start)
+            if(rev_enable) {
+                if(pptr <= pptr_start && flag == 3)
+                {
+                    //GpioDataRegs.GPADAT.bit.GPIO5 = 1; //Turn LED[1] off
+                    pptr = pptr_end;
+                    fade_factor = 0.0f;
+                    //DEBUG:
+                    fade_count_pos = 0;
+                    fade_count_neg = 0;
+                }
+                play_samp = SRAM_READ(pptr--);
+            }
+            else {
+                if((pptr >= 0x40000 || pptr >= pptr_end) && flag == 3)
+                {
                     //GpioDataRegs.GPADAT.bit.GPIO5 = 1; //Turn LED[1] off
                     pptr = pptr_start;
                     fade_factor = 0.0f;
@@ -111,25 +144,25 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
                     fade_count_pos = 0;
                     fade_count_neg = 0;
                 }
+                play_samp = SRAM_READ(pptr++);
             }
-            play_samp = SRAM_READ(pptr);
-            pptr++;
+            //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
 
-            fade_delta      = 1.0f/(fade_time*SAMP_RATE);
-            fade_in_mark    = pptr_start + fade_time * SAMP_RATE;
-            fade_out_mark   = pptr_start + pptr_length - fade_time * SAMP_RATE;
-
-            if(pptr <= fade_in_mark)
-            {
-                fade_factor += fade_delta;
-                fade_count_pos++;
-            }
-
-            if(pptr > fade_out_mark)
-            {
-                fade_factor -= fade_delta;
-                fade_count_neg++;
-            }
+//            fade_delta      = 1.0f/(fade_time*SAMP_RATE);
+//            fade_in_mark    = pptr_start + fade_time * SAMP_RATE;
+//            fade_out_mark   = pptr_start + pptr_length - fade_time * SAMP_RATE;
+//
+//            if(pptr <= fade_in_mark)
+//            {
+//                fade_factor += fade_delta;
+//                fade_count_pos++;
+//            }
+//
+//            if(pptr > fade_out_mark)
+//            {
+//                fade_factor -= fade_delta;
+//                fade_count_neg++;
+//            }
 
             play_samp = (int16)(play_samp);
 
@@ -141,14 +174,25 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
 
         //BUTTON CHECKS
         //DIP Switch Check//////////////////////////////////
+        //SW0 - Mix Enable
         if(GpioDataRegs.GPADAT.bit.GPIO0 == 0) {
-            mixenable = 1;
+            mix_enable = 1;
             GpioDataRegs.GPADAT.bit.GPIO7 = 0;
 
         }
         else {
-            mixenable = 0;
+            mix_enable = 0;
             GpioDataRegs.GPADAT.bit.GPIO7 = 1;
+        }
+        //SW1 - Reverse Mode
+        if(GpioDataRegs.GPADAT.bit.GPIO1 == 0) {
+            rev_enable = 1;
+            GpioDataRegs.GPADAT.bit.GPIO8 = 0;
+
+        }
+        else {
+            rev_enable = 0;
+            GpioDataRegs.GPADAT.bit.GPIO8 = 1;
         }
 
         //Check center button (Recording)///////////////////
@@ -205,7 +249,7 @@ volatile Uint32 fade_count_pos = 0, fade_count_neg = 0;
         }
         //SRAM OPERATION/////////////////////////////////////
         if(samp_ready && flag == 1) {
-            if(mixenable) {
+            if(mix_enable) {
                 sample = (LS+RS)/2;
                 prevsample = SRAM_READ(sptr);
                 mixsample = (sample + prevsample) / 2;
@@ -338,6 +382,24 @@ void IO_GPIO_Init() {
    GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 0;
    GpioCtrlRegs.GPAPUD.bit.GPIO0 = 0;
    GpioCtrlRegs.GPADIR.bit.GPIO0 = 0;
+
+   //SW1 -> GPIO1
+   GpioCtrlRegs.GPAGMUX1.bit.GPIO1 = 0;
+   GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 0;
+   GpioCtrlRegs.GPAPUD.bit.GPIO1 = 0;
+   GpioCtrlRegs.GPADIR.bit.GPIO1 = 0;
+
+   //SW2 -> GPIO2
+   GpioCtrlRegs.GPAGMUX1.bit.GPIO2 = 0;
+   GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 0;
+   GpioCtrlRegs.GPAPUD.bit.GPIO2 = 0;
+   GpioCtrlRegs.GPADIR.bit.GPIO2 = 0;
+
+   //SW3 -> GPIO3
+   GpioCtrlRegs.GPAGMUX1.bit.GPIO2 = 0;
+   GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 0;
+   GpioCtrlRegs.GPAPUD.bit.GPIO2 = 0;
+   GpioCtrlRegs.GPADIR.bit.GPIO2 = 0;
 
    // PB0 -> GPIO14
    GpioCtrlRegs.GPAGMUX1.bit.GPIO14 = 0;
