@@ -161,3 +161,6 @@ Debug/GrainField 5000.d
 Debug/GrainField 5000.obj
 GrainField 5000_working core.c
 GrainField 5000_backup.c
+Debug/GrainField-5000.d
+Debug/GrainField-5000.obj
+GrainField 5000_just about final version, w comments.c

@@ -11,22 +11,22 @@
 #include "SRAM_Driver.h"
 #include "AIC23.h"
 #include "LCD_Driver.h"
-
+////////////////////////////////////////////////////////////////
+//Defines///////////////////////////////////////////////////////
 #define     delay_200ms()   for(volatile long j=0; j < 1400000; j++)
 #define     SAMP_RATE       48000.0
 #define     RESOLUTION      0.000738435546875
 #define     WEIGHTING       0.4
-#define     DEADZONE        80
-
+#define     DEADZONE        70
 //ADC output value range
 #define     ADC_MIN             0
 #define     ADC_MAX             4095
 //SRAM pointer range
 #define     SAMP_MIN            10000
-#define     SAMP_MAX            0x3ffff //262143
+#define     SAMP_MAX            0x3fff0 //262143
 //Loop length range
 #define     LEN_MIN             320
-#define     LEN_MAX             24000.0   //0.25 Hz
+#define     LEN_MAX             24000.0   //0.5 Hz
 //rand() range
 #define     RAND_MIN            0
 #define     RAND_MAX            32767
@@ -36,8 +36,8 @@
 //Length spray range
 #define     LENGTH_SPRAY_MIN    0
 #define     LENGTH_SPRAY_MAX    12000
-
-//Initialization functions
+////////////////////////////////////////////////////////////////
+//Initialization functions//////////////////////////////////////
 void InitMcBSPb();
 void InitSPIA();
 void InitAIC23();
@@ -45,37 +45,38 @@ void IO_GPIO_Init();
 void InitTimer1(void);
 void InitAdca(void);
 void InitAdcb(void);
-//Operation functions
+////////////////////////////////////////////////////////////////
+//Operation Functions///////////////////////////////////////////
 void ButtonCheck(void);
 void SwitchCheck(void);
-void Record(void);
 void UpdateValues(void);
-//ISRs
+void Record(void);
+void Playback(void);
+////////////////////////////////////////////////////////////////
+//ISRs//////////////////////////////////////////////////////////
 interrupt void Timer1_isr(void);
 interrupt void McBSP_RX_ISR(void);
-
-//Global control flags
-volatile Uint16 flag = 0, rand_enable = 0, rev_enable = 0, pptr_0_trig = 0, pptr_1_trig = 0;
-//Sample vars
-volatile int16 LS, RS, throwaway, samp_ready, play_samp, play_samp_0, play_samp_1, play_ready, sample, prevsample, mixsample;
+////////////////////////////////////////////////////////////////
+//Global Control Flags//////////////////////////////////////////
+volatile Uint16 flag = 0, rand_enable = 0, smooth_enable = 1, pptr_0_trig = 0, pptr_1_trig = 0;
+////////////////////////////////////////////////////////////////
+//Sampling & Playback Variables/////////////////////////////////
+volatile int16 LS, RS, throwaway, passthrough, samp_ready, play_samp, play_samp_0, play_samp_1, play_ready, sample;
 volatile Uint32 sptr = 0, pptr_0 = 0, pptr_1 = 0, pptr_start = 10000, pptr_length = 5000, pptr_end = 15000, pptr_half_0 = 12500, pptr_half_1 = 12500;
 volatile Uint32 pptr_start_rand_range = 0, pptr_length_rand_range = 0;
 volatile int32 pptr_start_rand = 0, pptr_length_rand = 0;
 volatile float fade_factor_0 = 0.0f, fade_factor_1 = 0.0f, fade_delta_0 = 0.0f, fade_delta_1 = 0.0f;
-volatile Uint32 randnum = 0;
-//ADC vars
+////////////////////////////////////////////////////////////////
+//ADC Variables/////////////////////////////////////////////////
 volatile Uint16 adc_data_0 = 0, adc_data_1 = 0;
 volatile float  adc_acc_0  = 0, adc_acc_1  = 0, adc_smoov_0 = 0, adc_smoov_1 = 0, adc_diff_0 = 0, adc_diff_1 = 0, adc_prev_0 = 0, adc_prev_1 = 0, adc_curr_0 = 0, adc_curr_1 = 0;
-int decRes,ones,tenths,hundredths;
-
-//LCD Commands:
+////////////////////////////////////////////////////////////////
+//LCD Commands//////////////////////////////////////////////////
 Uint16  nextLine     = 0xC0;
 Uint16  clear        = 0x01;
 Uint16  home         = 0x02;
-
-//DEBUG:
-volatile Uint32 fade_count_pos_0 = 0, fade_count_neg_0 = 0,fade_count_pos_1 = 0, fade_count_neg_1 = 0;
-
+////////////////////////////////////////////////////////////////
+//Functions/////////////////////////////////////////////////////
 int main(void){
     InitSysCtrl();      // Set SYSCLK to 200 MHz, disables watchdog timer, turns on peripheral clocks
 
@@ -116,129 +117,46 @@ int main(void){
     LCD_SEND_COMMAND(&clear);
     LCD_SEND_STRING("    STANDBY");
     while(1) {
-        //randnum = rand();
         //MODE CHECKS
         SwitchCheck();
 
         if(play_ready && flag == 3) {
-            //Reverse mode (playback starts from pptr_end to pptr_start)
-            if(rev_enable) {
-//                if(pptr <= pptr_start && flag == 3)
-//                {
-//                    //GpioDataRegs.GPADAT.bit.GPIO5 = 1; //Turn LED[1] off
-//                    pptr = pptr_end;
-//                    fade_factor = 0.0f;
-//                    //DEBUG:
-//                    fade_count_pos = 0;
-//                    fade_count_neg = 0;
-//                    //
-//                    pptr_start  = (((adc_data_0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
-//                    pptr_length = (((adc_data_1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
-//                    pptr_end = (pptr_start + pptr_length);
-//                    pptr_half = pptr_start + (pptr_length/2);
-//                }
-//                play_samp = SRAM_READ(pptr--);
-            }
-            //Forward mode
-            else {
                 // pptr_0 passes midpoint and triggers pptr_1
                 if(!pptr_1_trig && pptr_0 >= pptr_half_0) {
-                    UpdateValues();
-                    if(rand_enable) {
-                        //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
-                        pptr_start_rand     = (((rand()) * (pptr_start_rand_range + pptr_start_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_start_rand_range;
-                        pptr_length_rand    = (((rand()) * (pptr_length_rand_range + pptr_length_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_length_rand_range;
-                        // Ensure proper start function
-                        if((int32)pptr_start + pptr_start_rand >= SAMP_MAX) {
-                            pptr_start = SAMP_MAX - LENGTH_SPRAY_MAX;
-                        } else if((int32)pptr_start + pptr_start_rand < SAMP_MIN){
-                            pptr_start = SAMP_MIN;
-                        }
-                        else {
-                            pptr_start += pptr_start_rand;
-                        }
-                        // Ensure proper length function
-                        if((int32)pptr_start + pptr_length + pptr_length_rand >= SAMP_MAX) {
-                            pptr_length = SAMP_MAX - pptr_start;
-                        } else if((int32)pptr_length + pptr_length_rand < LEN_MIN) {
-                            pptr_length = LEN_MIN;
-                        } else if((int32)pptr_start + pptr_length + pptr_length_rand < SAMP_MIN) {
-                            pptr_length = pptr_start - SAMP_MIN;
-                        } else {
-                            pptr_length += pptr_length_rand;
-                        }
-                    }
+                    Playback();
                     pptr_half_1 = pptr_start + (pptr_length/2);
                     fade_delta_1 = 1.0f/(pptr_length/2);
                     fade_factor_1 = 0.0f;
                     pptr_1 = pptr_start;
                     pptr_1_trig = 1;
                     pptr_0_trig = 0;
-
-                    //DEBUG:
-                    fade_count_pos_1 = 0;
-                    fade_count_neg_1 = 0;
-                    //
                 }
                 // pptr_1 passes midpoint and triggers pptr_0
                 if(!pptr_0_trig && pptr_1 >= pptr_half_1) {
-                    UpdateValues();
-                    if(rand_enable) {
-                        //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
-                        pptr_start_rand     = (((rand()) * (pptr_start_rand_range + pptr_start_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_start_rand_range;
-                        pptr_length_rand    = (((rand()) * (pptr_length_rand_range + pptr_length_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_length_rand_range;
-                        // Ensure proper start functioning
-                        if((int32)pptr_start + pptr_start_rand >= SAMP_MAX) {
-                            pptr_start = SAMP_MAX - LENGTH_SPRAY_MAX;
-                        } else if((int32)pptr_start + pptr_start_rand < 0){
-                            pptr_start = 0;
-                        }
-                        else {
-                            pptr_start += pptr_start_rand;
-                        }
-                        // Ensure proper length function
-                        if((int32)pptr_start + pptr_length + pptr_length_rand >= SAMP_MAX) {
-                            pptr_length = SAMP_MAX - pptr_start;
-                        } else if((int32)pptr_length + pptr_length_rand < LEN_MIN) {
-                            pptr_length = LEN_MIN;
-                        } else if((int32)pptr_start + pptr_length + pptr_length_rand < SAMP_MIN) {
-                            pptr_length = pptr_start - SAMP_MIN;
-                        } else {
-                            pptr_length += pptr_length_rand;
-                        }
-                    }
+                    Playback();
                     pptr_half_0 = pptr_start + (pptr_length/2);
                     fade_delta_0 = 1.0f/(pptr_length/2);
                     fade_factor_0 = 0.0f;
                     pptr_0 = pptr_start;
                     pptr_0_trig = 1;
                     pptr_1_trig = 0;
-
-                    //DEBUG:
-                    fade_count_pos_0 = 0;
-                    fade_count_neg_0 = 0;
-                    //
                 }
 
                 if(pptr_0 < pptr_half_0)
                 {
                     fade_factor_0 += fade_delta_0;
-                    fade_count_pos_0++;
                 }
                 if(pptr_0 >= pptr_half_0)
                 {
                     fade_factor_0 -= fade_delta_0;
-                    fade_count_neg_0++;
                 }
                 if(pptr_1 < pptr_half_1)
                 {
                     fade_factor_1 += fade_delta_1;
-                    fade_count_pos_1++;
                 }
                 if(pptr_1 >= pptr_half_1)
                 {
                     fade_factor_1 -= fade_delta_1;
-                    fade_count_neg_1++;
                 }
 
                 if(fade_factor_0 > 1)
@@ -257,12 +175,10 @@ int main(void){
                 {
                     fade_factor_1 = 0;
                 }
-                play_samp_0 = SRAM_READ(pptr_0);
-                play_samp_1 = SRAM_READ(pptr_1);
-            }
+
+            play_samp_0 = SRAM_READ(pptr_0++);
+            play_samp_1 = SRAM_READ(pptr_1++);
             play_samp = (int16)(((play_samp_0*fade_factor_0) + (play_samp_1*fade_factor_1))/2);
-            pptr_0++;
-            pptr_1++;
             play_ready = 0;
         }
         //BUTTON CHECKS
@@ -271,11 +187,34 @@ int main(void){
         //RECORD TO SRAM
         Record();
     }
-
 }
-
+void Playback(void) {
+    UpdateValues();
+    if(rand_enable) {
+        pptr_start_rand     = (((rand()) * (pptr_start_rand_range + pptr_start_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_start_rand_range;
+        pptr_length_rand    = (((rand()) * (pptr_length_rand_range + pptr_length_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_length_rand_range;
+        // Ensure proper start function
+        if((int32)pptr_start + pptr_start_rand >= SAMP_MAX) {
+            pptr_start = SAMP_MAX - LEN_MAX;
+        } else if((int32)pptr_start + pptr_start_rand < SAMP_MIN){
+            pptr_start = SAMP_MIN;
+        }
+        else {
+            pptr_start += pptr_start_rand;
+        }
+        // Ensure proper length function
+        if((int32)pptr_start + pptr_length + pptr_length_rand >= SAMP_MAX) {
+            pptr_length = SAMP_MAX - pptr_start;
+        } else if((int32)pptr_length + pptr_length_rand < LEN_MIN) {
+            pptr_length = LEN_MIN;
+        } else if((int32)pptr_start + pptr_length + pptr_length_rand < SAMP_MIN) {
+            pptr_length = pptr_start - SAMP_MIN;
+        } else {
+            pptr_length += pptr_length_rand;
+        }
+    }
+}
 void SwitchCheck(void) {
-    //DIP Switch Check//////////////////////////////////
     //SW0 - Rand Enable
     if(GpioDataRegs.GPADAT.bit.GPIO0 == 0) {
         rand_enable = 1;
@@ -286,15 +225,15 @@ void SwitchCheck(void) {
         rand_enable = 0;
         GpioDataRegs.GPADAT.bit.GPIO7 = 1;
     }
-    //SW1 - Reverse Mode
+    //SW1 - Smooth Disable Mode
     if(GpioDataRegs.GPADAT.bit.GPIO1 == 0) {
-        rev_enable = 1;
-        GpioDataRegs.GPADAT.bit.GPIO8 = 0;
+        smooth_enable = 0;
+        GpioDataRegs.GPADAT.bit.GPIO11 = 0;
 
     }
     else {
-        rev_enable = 0;
-        GpioDataRegs.GPADAT.bit.GPIO8 = 1;
+        smooth_enable = 1;
+        GpioDataRegs.GPADAT.bit.GPIO11 = 1;
     }
 }
 
@@ -371,6 +310,14 @@ void ButtonCheck(void) {
         delay_200ms();
         delay_200ms();
     }
+    if(flag == 0 && GpioDataRegs.GPADAT.bit.GPIO14 == 0) {
+        GpioDataRegs.GPADAT.bit.GPIO4 = 0;
+        pptr_start_rand_range = (((adc_curr_0 - ADC_MIN) * (START_SPRAY_MAX - START_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + START_SPRAY_MIN;
+        pptr_length_rand_range = (((adc_curr_1 - ADC_MIN) * (LENGTH_SPRAY_MAX - LENGTH_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + LENGTH_SPRAY_MIN;
+    }
+    else if(flag == 0){
+        GpioDataRegs.GPADAT.bit.GPIO4 = 1;
+    }
 }
 
 void Record(void) {
@@ -387,7 +334,6 @@ void Record(void) {
             flag = 0;   //end recording
             sptr = 0;
     }
-
     if(samp_ready && flag == 1) {
         sample = (LS+RS)/2;
         SRAM_WRITE(sptr, sample);
@@ -400,7 +346,9 @@ void UpdateValues(void) {
     if(GpioDataRegs.GPADAT.bit.GPIO14 == 0) {
         // Turn on LED that corresponds to random mode selection
         GpioDataRegs.GPADAT.bit.GPIO4 = 0;
-        //NewValue = (((OldValue - OldMin) * (NewMax - NewMin)) / (OldMax - OldMin)) + NewMin
+        pptr_start  = (((adc_curr_0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+        pptr_length = (((adc_curr_1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+        pptr_end = (pptr_start + pptr_length);
         // Sets max value for start pptr spray
         pptr_start_rand_range = (((adc_curr_0 - ADC_MIN) * (START_SPRAY_MAX - START_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + START_SPRAY_MIN;
         pptr_length_rand_range = (((adc_curr_1 - ADC_MIN) * (LENGTH_SPRAY_MAX - LENGTH_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + LENGTH_SPRAY_MIN;
@@ -415,37 +363,47 @@ void UpdateValues(void) {
 }
 
 interrupt void Timer1_isr(void) {
-    AdcaRegs.ADCSOCFRC1.bit.SOC0 = 1;          // Force conversion on channel 0
-    adc_data_0 = AdcaResultRegs.ADCRESULT0;    // Read ADC result into global variable
-    AdcbRegs.ADCSOCFRC1.bit.SOC0 = 1;          // Force conversion on channel 1
-    adc_data_1 = AdcbResultRegs.ADCRESULT0;    // Read ADC result into global variable
-    adc_smoov_0 = adc_smoov_0 + (WEIGHTING * (adc_data_0 - adc_smoov_0));
-    adc_smoov_1 = adc_smoov_1 + (WEIGHTING * (adc_data_1 - adc_smoov_1));
-    adc_diff_0 = adc_smoov_0 - adc_prev_0;
-    if(abs(adc_diff_0) > DEADZONE) {
-        adc_curr_0 = adc_smoov_0;
-        adc_prev_0 = adc_smoov_0;
+    AdcaRegs.ADCSOCFRC1.bit.SOC0 = 1;
+    adc_data_0 = AdcaResultRegs.ADCRESULT0;
+    AdcbRegs.ADCSOCFRC1.bit.SOC0 = 1;
+    adc_data_1 = AdcbResultRegs.ADCRESULT0;
+    if(smooth_enable) {
+        adc_smoov_0 = adc_smoov_0 + (WEIGHTING * (adc_data_0 - adc_smoov_0));
+        adc_smoov_1 = adc_smoov_1 + (WEIGHTING * (adc_data_1 - adc_smoov_1));
+        adc_diff_0 = adc_smoov_0 - adc_prev_0;
+        if(abs(adc_diff_0) > DEADZONE) {
+            adc_curr_0 = adc_smoov_0;
+            adc_prev_0 = adc_smoov_0;
+        }
+        adc_diff_1 = adc_smoov_1 - adc_prev_1;
+        if(abs(adc_diff_1) > DEADZONE) {
+            adc_curr_1 = adc_smoov_1;
+            adc_prev_1 = adc_smoov_1;
+        }
     }
-    adc_diff_1 = adc_smoov_1 - adc_prev_1;
-    if(abs(adc_diff_1) > DEADZONE) {
-        adc_curr_1 = adc_smoov_1;
-        adc_prev_1 = adc_smoov_1;
+    else {
+        adc_curr_0 = adc_data_0;
+        adc_curr_1 = adc_data_1;
     }
+
 }
 
 interrupt void McBSP_RX_ISR(void) {
-     // Case: Do nothing
+     // Case: Standby (passthrough) //////////////////////////////////////
      if(flag == 0) {
-             throwaway = McbspbRegs.DRR2.all;
-             throwaway = McbspbRegs.DRR1.all;
+             LS = McbspbRegs.DRR2.all;
+             RS = McbspbRegs.DRR1.all;
 
-             McbspbRegs.DXR2.all = 0x0000;
-             McbspbRegs.DXR1.all = 0x0000;
+             McbspbRegs.DXR2.all = LS;
+             McbspbRegs.DXR1.all = RS;
      }
      // Case: Record sound into buffer ///////////////////////////////////
      else if(flag == 1) {
              LS = McbspbRegs.DRR2.all;
              RS = McbspbRegs.DRR1.all;
+
+             McbspbRegs.DXR2.all = LS;
+             McbspbRegs.DXR1.all = RS;
              samp_ready = 1;
              sptr++;
      }
@@ -464,29 +422,29 @@ interrupt void McBSP_RX_ISR(void) {
 }
 
 void InitAdca(void) {
-    AdcaRegs.ADCCTL2.bit.PRESCALE = 6;                                 // Set ADCCLK to SYSCLK/4
-    AdcSetMode(ADC_ADCA, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE); // Initializes ADCA to 12-bit and single-ended mode. Performs internal calibration
-    AdcaRegs.ADCCTL1.bit.ADCPWDNZ = 1;                                 // Powers up ADC
-    DELAY_US(1000);                                                    // Delay to allow ADC to power up
-    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 0;                                 // Sets SOC0 to channel 0 -> pin ADCINA0
-    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 14;                                // Sets sample and hold window -> must be at least 1 ADC clock long
+    AdcaRegs.ADCCTL2.bit.PRESCALE = 6;
+    AdcSetMode(ADC_ADCA, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE);
+    AdcaRegs.ADCCTL1.bit.ADCPWDNZ = 1;
+    DELAY_US(1000);
+    AdcaRegs.ADCSOC0CTL.bit.CHSEL = 0;
+    AdcaRegs.ADCSOC0CTL.bit.ACQPS = 14;
 }
 
 void InitAdcb(void) {
-    AdcbRegs.ADCCTL2.bit.PRESCALE = 6;                                 // Set ADCCLK to SYSCLK/4
-    AdcSetMode(ADC_ADCB, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE); // Initializes ADCA to 12-bit and single-ended mode. Performs internal calibration
-    AdcbRegs.ADCCTL1.bit.ADCPWDNZ = 1;                                 // Powers up ADC
-    DELAY_US(1000);                                                    // Delay to allow ADC to power up
-    AdcbRegs.ADCSOC0CTL.bit.CHSEL = 3;                                 // Sets SOC0 to channel 0 -> pin ADCINA0
-    AdcbRegs.ADCSOC0CTL.bit.ACQPS = 14;                                // Sets sample and hold window -> must be at least 1 ADC clock long
+    AdcbRegs.ADCCTL2.bit.PRESCALE = 6;
+    AdcSetMode(ADC_ADCB, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE);
+    AdcbRegs.ADCCTL1.bit.ADCPWDNZ = 1;
+    DELAY_US(1000);
+    AdcbRegs.ADCSOC0CTL.bit.CHSEL = 3;
+    AdcbRegs.ADCSOC0CTL.bit.ACQPS = 14;
 }
 
 void InitTimer1(void) {
-    InitCpuTimers();                            // Initialize all timers to known state
-    ConfigCpuTimer(&CpuTimer1, 200, 400000);    // Configure CPU timer 1. 200 -> SYSCLK in MHz, 500000 -> period in usec. NOTE: Does NOT start timer
-    PieVectTable.TIMER1_INT = &Timer1_isr;      // Assign timer 1 ISR to PIE vector table
-    IER |= M_INT13;                             // Enable INT13 in CPU
-    CpuTimer1.RegsAddr->TCR.bit.TSS = 0;        // Start timer 1
+    InitCpuTimers();
+    ConfigCpuTimer(&CpuTimer1, 200, 400000);
+    PieVectTable.TIMER1_INT = &Timer1_isr;
+    IER |= M_INT13;
+    CpuTimer1.RegsAddr->TCR.bit.TSS = 0;
 }
 
 void IO_GPIO_Init() {
