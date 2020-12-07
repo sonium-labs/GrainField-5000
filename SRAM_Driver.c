@@ -153,7 +153,7 @@ void SPIB_Init() {
     //Baud Rate Settings
     ClkCfgRegs.LOSPCP.bit.LSPCLKDIV = 0;        //Set LSPCLK = SYSCLK (200MHz)
     SpibRegs.SPICCR.bit.HS_MODE = 1;            //Enable high-speed mode
-    SpibRegs.SPIBRR.all = 10;                    //Set baud rate to 200MHz/10 = 20 MHz
+    SpibRegs.SPIBRR.all = 5;                    //Set baud rate to 200MHz/10 = 20 MHz
 
     //Set SPI character length to 8-bits
     SpibRegs.SPICCR.bit.SPICHAR = 0x7;
