@@ -1,82 +1,36 @@
 ////////////////////////////////////////////////////////////////
-/* GrainField 5000
+/* GrainField-5000
  * Author: Daniel Dole-Muinos
  * Description: Granular hardware sampler*/
 ////////////////////////////////////////////////////////////////
 //Includes//////////////////////////////////////////////////////
 #include <F28x_Project.h>
-#include <math.h>
-#include <stdio.h>
 #include <stdlib.h>
+#include "GrainField-5000.h"
 #include "SRAM_Driver.h"
 #include "AIC23.h"
 #include "LCD_Driver.h"
 ////////////////////////////////////////////////////////////////
-//Defines///////////////////////////////////////////////////////
-#define     delay_200ms()   for(volatile long j=0; j < 1400000; j++)
-#define     SAMP_RATE       48000.0
-#define     RESOLUTION      0.000738435546875
-#define     WEIGHTING       0.4
-#define     DEADZONE        70
-//ADC output value range
-#define     ADC_MIN             0
-#define     ADC_MAX             4095
-//SRAM pointer range
-#define     SAMP_MIN            10000
-#define     SAMP_MAX            0x3fff0 //262143
-//Loop length range
-#define     LEN_MIN             320
-#define     LEN_MAX             24000.0   //0.5 Hz
-//rand() range
-#define     RAND_MIN            0
-#define     RAND_MAX            32767
-//Start spray range
-#define     START_SPRAY_MIN     0
-#define     START_SPRAY_MAX     100000
-//Length spray range
-#define     LENGTH_SPRAY_MIN    0
-#define     LENGTH_SPRAY_MAX    12000
+// Global Control Flags ////////////////////////////////////////
+volatile Uint16 flag = 0;
+volatile bool   rand_enable = false, smooth_enable = true, pptr_0_trig = false, pptr_1_trig = false,
+                new_adc = false, samp_ready = false, play_ready = false, rand_val_update = false;
 ////////////////////////////////////////////////////////////////
-//Initialization functions//////////////////////////////////////
-void InitMcBSPb();
-void InitSPIA();
-void InitAIC23();
-void IO_GPIO_Init();
-void InitTimer1(void);
-void InitAdca(void);
-void InitAdcb(void);
+// Sampling & Playback Variables ///////////////////////////////
+volatile int16  play_samp = -99, rec_samp = -99;
+volatile Uint32 sptr = 0, pptr_0 = 0, pptr_1 = 0, pptr_start = PPTR_START, pptr_length = PPTR_LENGTH, pptr_end = PPTR_END,
+                pptr_half_0 = (PPTR_START+PPTR_LENGTH/2), pptr_half_1 = (PPTR_START+PPTR_LENGTH/2), pptr_start_rand_range = 0, pptr_length_rand_range = 0;
+volatile int32  pptr_start_rand = 0, pptr_length_rand = 0;
+volatile float  fade_factor_0 = 0.0f, fade_factor_1 = 0.0f;
 ////////////////////////////////////////////////////////////////
-//Operation Functions///////////////////////////////////////////
-void ButtonCheck(void);
-void SwitchCheck(void);
-void UpdateValues(void);
-void Record(void);
-void Playback(void);
-////////////////////////////////////////////////////////////////
-//ISRs//////////////////////////////////////////////////////////
-interrupt void Timer1_isr(void);
-interrupt void McBSP_RX_ISR(void);
-////////////////////////////////////////////////////////////////
-//Global Control Flags//////////////////////////////////////////
-volatile Uint16 flag = 0, rand_enable = 0, smooth_enable = 1, pptr_0_trig = 0, pptr_1_trig = 0;
-////////////////////////////////////////////////////////////////
-//Sampling & Playback Variables/////////////////////////////////
-volatile int16 LS, RS, throwaway, passthrough, samp_ready, play_samp, play_samp_0, play_samp_1, play_ready, sample;
-volatile Uint32 sptr = 0, pptr_0 = 0, pptr_1 = 0, pptr_start = 10000, pptr_length = 5000, pptr_end = 15000, pptr_half_0 = 12500, pptr_half_1 = 12500;
-volatile Uint32 pptr_start_rand_range = 0, pptr_length_rand_range = 0;
-volatile int32 pptr_start_rand = 0, pptr_length_rand = 0;
-volatile float fade_factor_0 = 0.0f, fade_factor_1 = 0.0f, fade_delta_0 = 0.0f, fade_delta_1 = 0.0f;
-////////////////////////////////////////////////////////////////
-//ADC Variables/////////////////////////////////////////////////
+// ADC Variables ///////////////////////////////////////////////
 volatile Uint16 adc_data_0 = 0, adc_data_1 = 0;
-volatile float  adc_acc_0  = 0, adc_acc_1  = 0, adc_smoov_0 = 0, adc_smoov_1 = 0, adc_diff_0 = 0, adc_diff_1 = 0, adc_prev_0 = 0, adc_prev_1 = 0, adc_curr_0 = 0, adc_curr_1 = 0;
+volatile float  adc_curr_0 = 0, adc_curr_1 = 0;
 ////////////////////////////////////////////////////////////////
-//LCD Commands//////////////////////////////////////////////////
-Uint16  nextLine     = 0xC0;
-Uint16  clear        = 0x01;
-Uint16  home         = 0x02;
+// LCD Commands ////////////////////////////////////////////////
+extern  Uint16  clear;
 ////////////////////////////////////////////////////////////////
-//Functions/////////////////////////////////////////////////////
+// Functions ///////////////////////////////////////////////////
 int main(void){
     InitSysCtrl();      // Set SYSCLK to 200 MHz, disables watchdog timer, turns on peripheral clocks
 
@@ -87,7 +41,6 @@ int main(void){
 
     DINT;               // Disable CPU interrupts on startup
 
-    // Init PIE
     InitPieCtrl();      // Initialize PIE -> disable PIE and clear all PIE registers
     IER = 0x0000;       // Clear CPU interrupt register
     IFR = 0x0000;       // Clear CPU interrupt flag register
@@ -101,149 +54,165 @@ int main(void){
 
     PieVectTable.MCBSPB_RX_INT = &McBSP_RX_ISR;
     IER |= M_INT6;
-    PieCtrlRegs.PIEIER6.bit.INTx7 = 1;          //Enable McBSPBRx interrupt
+    PieCtrlRegs.PIEIER6.bit.INTx7 = 1;          // Enable McBSPBRx interrupt
 
-    SRAM_GPIO_Init();
+    SRAM_GPIO_Init();       // Initialize peripherals
     IO_GPIO_Init();
     SPIB_Init();
     InitSPIA();
     InitAIC23();
     InitMcBSPb();
-
-    SRAM_CLEAR();
+    SRAM_CLEAR();           // Zero out SRAMs
 
     EnableInterrupts();
 
     LCD_SEND_COMMAND(&clear);
     LCD_SEND_STRING("    STANDBY");
+
     while(1) {
-        //MODE CHECKS
-        SwitchCheck();
-
-        if(play_ready && flag == 3) {
-                // pptr_0 passes midpoint and triggers pptr_1
-                if(!pptr_1_trig && pptr_0 >= pptr_half_0) {
-                    Playback();
-                    pptr_half_1 = pptr_start + (pptr_length/2);
-                    fade_delta_1 = 1.0f/(pptr_length/2);
-                    fade_factor_1 = 0.0f;
-                    pptr_1 = pptr_start;
-                    pptr_1_trig = 1;
-                    pptr_0_trig = 0;
-                }
-                // pptr_1 passes midpoint and triggers pptr_0
-                if(!pptr_0_trig && pptr_1 >= pptr_half_1) {
-                    Playback();
-                    pptr_half_0 = pptr_start + (pptr_length/2);
-                    fade_delta_0 = 1.0f/(pptr_length/2);
-                    fade_factor_0 = 0.0f;
-                    pptr_0 = pptr_start;
-                    pptr_0_trig = 1;
-                    pptr_1_trig = 0;
-                }
-
-                if(pptr_0 < pptr_half_0)
-                {
-                    fade_factor_0 += fade_delta_0;
-                }
-                if(pptr_0 >= pptr_half_0)
-                {
-                    fade_factor_0 -= fade_delta_0;
-                }
-                if(pptr_1 < pptr_half_1)
-                {
-                    fade_factor_1 += fade_delta_1;
-                }
-                if(pptr_1 >= pptr_half_1)
-                {
-                    fade_factor_1 -= fade_delta_1;
-                }
-
-                if(fade_factor_0 > 1)
-                {
-                    fade_factor_0 = 1;
-                }
-                if(fade_factor_0 < 0)
-                {
-                    fade_factor_0 = 0;
-                }
-                if(fade_factor_1 > 1)
-                {
-                    fade_factor_1 = 1;
-                }
-                if(fade_factor_1 < 0)
-                {
-                    fade_factor_1 = 0;
-                }
-
-            play_samp_0 = SRAM_READ(pptr_0++);
-            play_samp_1 = SRAM_READ(pptr_1++);
-            play_samp = (int16)(((play_samp_0*fade_factor_0) + (play_samp_1*fade_factor_1))/2);
-            play_ready = 0;
-        }
-        //BUTTON CHECKS
-        ButtonCheck();
-
-        //RECORD TO SRAM
-        Record();
+        SwitchCheck();      // MODE CHECKS
+        Playback();         // PLAYBACK CONTROL
+        ButtonCheck();      // BUTTON CHECKS
+        Record();           // RECORD TO SRAM
     }
 }
+
+////////////////////////////////////////////////////////////////
+/* Handles audio output from sound buffer (SRAM) */
 void Playback(void) {
-    UpdateValues();
-    if(rand_enable) {
-        pptr_start_rand     = (((rand()) * (pptr_start_rand_range + pptr_start_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_start_rand_range;
-        pptr_length_rand    = (((rand()) * (pptr_length_rand_range + pptr_length_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_length_rand_range;
-        // Ensure proper start function
-        if((int32)pptr_start + pptr_start_rand >= SAMP_MAX) {
-            pptr_start = SAMP_MAX - LEN_MAX;
-        } else if((int32)pptr_start + pptr_start_rand < SAMP_MIN){
-            pptr_start = SAMP_MIN;
+    int16 play_samp_0, play_samp_1;
+    static float fade_delta_0, fade_delta_1;
+    if(play_ready && flag == 3)
+    {
+        if(!pptr_1_trig && pptr_0 >= pptr_half_0) {             // pptr_0 passes midpoint and triggers pptr_1
+            UpdatePtrs();
+            pptr_half_1 = pptr_start + (pptr_length/2);
+            fade_delta_1 = 1.0f/(pptr_length/2);
+            fade_factor_1 = 0.0f;
+            pptr_1 = pptr_start;
+            pptr_1_trig = true;
+            pptr_0_trig = false;
         }
-        else {
-            pptr_start += pptr_start_rand;
+        if(!pptr_0_trig && pptr_1 >= pptr_half_1) {             // pptr_1 passes midpoint and triggers pptr_0
+            UpdatePtrs();
+            pptr_half_0 = pptr_start + (pptr_length/2);
+            fade_delta_0 = 1.0f/(pptr_length/2);
+            fade_factor_0 = 0.0f;
+            pptr_0 = pptr_start;
+            pptr_0_trig = true;
+            pptr_1_trig = false;
         }
-        // Ensure proper length function
-        if((int32)pptr_start + pptr_length + pptr_length_rand >= SAMP_MAX) {
-            pptr_length = SAMP_MAX - pptr_start;
-        } else if((int32)pptr_length + pptr_length_rand < LEN_MIN) {
-            pptr_length = LEN_MIN;
-        } else if((int32)pptr_start + pptr_length + pptr_length_rand < SAMP_MIN) {
-            pptr_length = pptr_start - SAMP_MIN;
-        } else {
-            pptr_length += pptr_length_rand;
-        }
+
+        if(pptr_0 < pptr_half_0) fade_factor_0 += fade_delta_0; // Manages fade factor
+        if(pptr_0 >= pptr_half_0) fade_factor_0 -= fade_delta_0;
+        if(pptr_1 < pptr_half_1) fade_factor_1 += fade_delta_1;
+        if(pptr_1 >= pptr_half_1) fade_factor_1 -= fade_delta_1;
+
+        if(fade_factor_0 > 1) fade_factor_0 = 1;                // Ensures fade factor cannot leave bounds
+        if(fade_factor_0 < 0) fade_factor_0 = 0;                // (mismatch of fade inc and dec can occur with changing sample A/B lengths)
+        if(fade_factor_1 > 1) fade_factor_1 = 1;
+        if(fade_factor_1 < 0) fade_factor_1 = 0;
+
+        play_samp_0 = SRAM_READ(pptr_0++);                      // Read SRAM at final ptr addr
+        play_samp_1 = SRAM_READ(pptr_1++);
+        play_samp = (int16)(((play_samp_0*fade_factor_0) + (play_samp_1*fade_factor_1))/2);
+        play_ready = false;
     }
 }
-void SwitchCheck(void) {
-    //SW0 - Rand Enable
-    if(GpioDataRegs.GPADAT.bit.GPIO0 == 0) {
-        rand_enable = 1;
-        GpioDataRegs.GPADAT.bit.GPIO7 = 0;
 
+////////////////////////////////////////////////////////////////
+/* Updates loop params based on ADC data (by default)
+ * Updates random values as well if right push button pressed */
+void UpdatePtrs(void) {
+    UpdateADC();
+    if(rand_val_update) {               // Set bounds for random mode if enabled
+        GpioDataRegs.GPADAT.bit.GPIO4 = 0;                  // Turn on LED that corresponds to random mode selection
+        pptr_start  = (((adc_curr_0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+        pptr_length = (((adc_curr_1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+        pptr_end = (pptr_start + pptr_length);
+        // Sets max value for start pptr spray
+        pptr_start_rand_range = (((adc_curr_0 - ADC_MIN) * (START_SPRAY_MAX - START_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + START_SPRAY_MIN;
+        pptr_length_rand_range = (((adc_curr_1 - ADC_MIN) * (LENGTH_SPRAY_MAX - LENGTH_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + LENGTH_SPRAY_MIN;
+        rand_val_update = false;
+    }
+    // Otherwise, continue with normal mode
+    else {
+        pptr_start  = (((adc_curr_0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
+        pptr_length = (((adc_curr_1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
+        pptr_end = (pptr_start + pptr_length);
+        GpioDataRegs.GPADAT.bit.GPIO4 = 1;
+    }
+    if(rand_enable) Randomizer();
+}
+
+////////////////////////////////////////////////////////////////
+/* Shuffles pptr_start and pptr_length based on random values */
+void Randomizer(void) {
+    pptr_start_rand     = (((rand()) * (pptr_start_rand_range + pptr_start_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_start_rand_range;
+    pptr_length_rand    = (((rand()) * (pptr_length_rand_range + pptr_length_rand_range)) / (RAND_MAX - RAND_MIN)) - pptr_length_rand_range;
+    // Ensure proper start function
+    if((int32)pptr_start + pptr_start_rand >= SAMP_MAX)     pptr_start = SAMP_MAX - LEN_MAX;
+    else if((int32)pptr_start + pptr_start_rand < SAMP_MIN) pptr_start = SAMP_MIN;
+    else                                                    pptr_start += pptr_start_rand;
+
+    // Ensure proper length function
+    if((int32)pptr_start + pptr_length + pptr_length_rand >= SAMP_MAX)      pptr_length = SAMP_MAX - pptr_start;
+    else if((int32)pptr_length + pptr_length_rand < LEN_MIN)                pptr_length = LEN_MIN;
+    else if((int32)pptr_start + pptr_length + pptr_length_rand < SAMP_MIN)  pptr_length = pptr_start - SAMP_MIN;
+    else                                                                    pptr_length += pptr_length_rand;
+}
+
+////////////////////////////////////////////////////////////////
+/* Record samples into buffer */
+void Record(void) {
+    if(sptr >= 0x40000 && flag == 1) {
+        LCD_SEND_COMMAND(&clear);
+        LCD_SEND_STRING(" REC COMPLETE!");
+        delay_200ms();
+        delay_200ms();
+        delay_200ms();
+        delay_200ms();
+        delay_200ms();
+        LCD_SEND_COMMAND(&clear);
+        LCD_SEND_STRING("    STANDBY");
+        flag = 0;                                       // end recording
+        sptr = 0;
+    }
+    if(samp_ready && flag == 1) {
+        SRAM_WRITE(sptr, rec_samp);
+        samp_ready = false;
+    }
+}
+
+////////////////////////////////////////////////////////////////
+/* Set mode flags based on switch position */
+void SwitchCheck(void) {
+    if(GpioDataRegs.GPADAT.bit.GPIO0 == 0) {                // SW0 - Rand Enable
+        rand_enable = true;
+        GpioDataRegs.GPADAT.bit.GPIO7 = 0;
     }
     else {
-        rand_enable = 0;
+        rand_enable = false;
         GpioDataRegs.GPADAT.bit.GPIO7 = 1;
     }
-    //SW1 - Smooth Disable Mode
-    if(GpioDataRegs.GPADAT.bit.GPIO1 == 0) {
-        smooth_enable = 0;
-        GpioDataRegs.GPADAT.bit.GPIO11 = 0;
 
+    if(GpioDataRegs.GPADAT.bit.GPIO1 == 0) {                // SW1 - Smooth Disable Mode
+        smooth_enable = false;
+        GpioDataRegs.GPADAT.bit.GPIO11 = 0;
     }
     else {
-        smooth_enable = 1;
+        smooth_enable = true;
         GpioDataRegs.GPADAT.bit.GPIO11 = 1;
     }
 }
 
+////////////////////////////////////////////////////////////////
+/* Update pointers for loop */
 void ButtonCheck(void) {
-    //Check center button (Recording)///////////////////
-    if(GpioDataRegs.GPADAT.bit.GPIO15 == 0) {
+    if(GpioDataRegs.GPADAT.bit.GPIO15 == 0) {               // Check center button (Recording)
         delay_200ms();
         if(GpioDataRegs.GPADAT.bit.GPIO16 == 0) {
-            // Double press found!
-            LCD_SEND_COMMAND(&clear);
+            LCD_SEND_COMMAND(&clear);                       // Double press found!
             LCD_SEND_STRING("CLEARING SRAM...");
             SRAM_CLEAR();
             LCD_SEND_COMMAND(&clear);
@@ -270,13 +239,10 @@ void ButtonCheck(void) {
         delay_200ms();
         delay_200ms();
     }
-
-    //Check left button (Playback)///////////////////////
-    else if(GpioDataRegs.GPADAT.bit.GPIO16 == 0) {
+    else if(GpioDataRegs.GPADAT.bit.GPIO16 == 0) {          // Check left button (Playback)
         delay_200ms();
         if(GpioDataRegs.GPADAT.bit.GPIO15 == 0) {
-            // Double press found!
-            LCD_SEND_COMMAND(&clear);
+            LCD_SEND_COMMAND(&clear);                       // Double press found!
             LCD_SEND_STRING("CLEARING SRAM...");
             SRAM_CLEAR();
             LCD_SEND_COMMAND(&clear);
@@ -298,129 +264,99 @@ void ButtonCheck(void) {
             if(flag == 0) {
                 LCD_SEND_COMMAND(&clear);
                 LCD_SEND_STRING("   PLAYING...");
-                // Set initial values for window
-                UpdateValues();
+                UpdatePtrs();                               // Set initial values for window ///////////////////////////////
                 pptr_0 = pptr_start;
                 fade_factor_0 = 0.0f;
                 fade_factor_1 = 0.0f;
-                // begin playback
-                flag = 3;
+                flag = 3;                                   // Begin playback
             }
         }
         delay_200ms();
         delay_200ms();
     }
-    if(flag == 0 && GpioDataRegs.GPADAT.bit.GPIO14 == 0) {
+    if(flag == 0 && GpioDataRegs.GPADAT.bit.GPIO14 == 0) {  // Check right button (Random Mode)
         GpioDataRegs.GPADAT.bit.GPIO4 = 0;
+        UpdateADC();
         pptr_start_rand_range = (((adc_curr_0 - ADC_MIN) * (START_SPRAY_MAX - START_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + START_SPRAY_MIN;
         pptr_length_rand_range = (((adc_curr_1 - ADC_MIN) * (LENGTH_SPRAY_MAX - LENGTH_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + LENGTH_SPRAY_MIN;
+        rand_val_update = true;
     }
     else if(flag == 0){
         GpioDataRegs.GPADAT.bit.GPIO4 = 1;
     }
 }
-
-void Record(void) {
-    if(sptr >= 0x40000 && flag == 1) {
-            LCD_SEND_COMMAND(&clear);
-            LCD_SEND_STRING(" REC COMPLETE!");
-            delay_200ms();
-            delay_200ms();
-            delay_200ms();
-            delay_200ms();
-            delay_200ms();
-            LCD_SEND_COMMAND(&clear);
-            LCD_SEND_STRING("    STANDBY");
-            flag = 0;   //end recording
-            sptr = 0;
-    }
-    if(samp_ready && flag == 1) {
-        sample = (LS+RS)/2;
-        SRAM_WRITE(sptr, sample);
-        samp_ready = 0;
-    }
-}
-
-void UpdateValues(void) {
-    // Set bounds for random mode
-    if(GpioDataRegs.GPADAT.bit.GPIO14 == 0) {
-        // Turn on LED that corresponds to random mode selection
-        GpioDataRegs.GPADAT.bit.GPIO4 = 0;
-        pptr_start  = (((adc_curr_0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
-        pptr_length = (((adc_curr_1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
-        pptr_end = (pptr_start + pptr_length);
-        // Sets max value for start pptr spray
-        pptr_start_rand_range = (((adc_curr_0 - ADC_MIN) * (START_SPRAY_MAX - START_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + START_SPRAY_MIN;
-        pptr_length_rand_range = (((adc_curr_1 - ADC_MIN) * (LENGTH_SPRAY_MAX - LENGTH_SPRAY_MIN)) / (ADC_MAX - ADC_MIN)) + LENGTH_SPRAY_MIN;
-    }
-    // Otherwise, continue with normal mode
-    else {
-        pptr_start  = (((adc_curr_0 - ADC_MIN) * (SAMP_MAX - SAMP_MIN)) / (ADC_MAX - ADC_MIN)) + SAMP_MIN;
-        pptr_length = (((adc_curr_1 - ADC_MIN) * (LEN_MAX - LEN_MIN)) / (ADC_MAX - ADC_MIN)) + LEN_MIN;
-        pptr_end = (pptr_start + pptr_length);
-        GpioDataRegs.GPADAT.bit.GPIO4 = 1;
+////////////////////////////////////////////////////////////////
+/* Update ADC values and applies smoothing if smooth mode enabled */
+void UpdateADC(void) {
+    float adc_smoov_0 = 0, adc_smoov_1 = 0, adc_diff_0 = 0, adc_diff_1 = 0;
+    static float adc_prev_0 = 0, adc_prev_1 = 0;
+    if(new_adc) {
+        if(smooth_enable) {         // Manages smoothing of ADC values
+            adc_smoov_0 = adc_smoov_0 + (WEIGHTING * (adc_data_0 - adc_smoov_0));
+            adc_smoov_1 = adc_smoov_1 + (WEIGHTING * (adc_data_1 - adc_smoov_1));
+            adc_diff_0 = adc_smoov_0 - adc_prev_0;
+            if(abs(adc_diff_0) > DEADZONE) {
+                adc_curr_0 = adc_smoov_0;
+                adc_prev_0 = adc_smoov_0;
+            }
+            adc_diff_1 = adc_smoov_1 - adc_prev_1;
+            if(abs(adc_diff_1) > DEADZONE) {
+                adc_curr_1 = adc_smoov_1;
+                adc_prev_1 = adc_smoov_1;
+            }
+        }
+        else {
+            adc_curr_0 = adc_data_0;
+            adc_curr_1 = adc_data_1;
+        }
+        new_adc = false;
     }
 }
-
+////////////////////////////////////////////////////////////////
+/* Timer ISR: polls ADCs for new data */
 interrupt void Timer1_isr(void) {
     AdcaRegs.ADCSOCFRC1.bit.SOC0 = 1;
     adc_data_0 = AdcaResultRegs.ADCRESULT0;
     AdcbRegs.ADCSOCFRC1.bit.SOC0 = 1;
     adc_data_1 = AdcbResultRegs.ADCRESULT0;
-    if(smooth_enable) {
-        adc_smoov_0 = adc_smoov_0 + (WEIGHTING * (adc_data_0 - adc_smoov_0));
-        adc_smoov_1 = adc_smoov_1 + (WEIGHTING * (adc_data_1 - adc_smoov_1));
-        adc_diff_0 = adc_smoov_0 - adc_prev_0;
-        if(abs(adc_diff_0) > DEADZONE) {
-            adc_curr_0 = adc_smoov_0;
-            adc_prev_0 = adc_smoov_0;
-        }
-        adc_diff_1 = adc_smoov_1 - adc_prev_1;
-        if(abs(adc_diff_1) > DEADZONE) {
-            adc_curr_1 = adc_smoov_1;
-            adc_prev_1 = adc_smoov_1;
-        }
-    }
-    else {
-        adc_curr_0 = adc_data_0;
-        adc_curr_1 = adc_data_1;
-    }
-
+    new_adc = true;
 }
-
+////////////////////////////////////////////////////////////////
+/* McBSP ISR: interact with McBSP peripheral based on mode */
 interrupt void McBSP_RX_ISR(void) {
-     // Case: Standby (passthrough) //////////////////////////////////////
-     if(flag == 0) {
-             LS = McbspbRegs.DRR2.all;
-             RS = McbspbRegs.DRR1.all;
+     int16 throwaway, LS, RS;
+     if(flag == 0) {                             // Case: Standby (passthrough)
+         LS = McbspbRegs.DRR2.all;
+         RS = McbspbRegs.DRR1.all;
 
-             McbspbRegs.DXR2.all = LS;
-             McbspbRegs.DXR1.all = RS;
+         McbspbRegs.DXR2.all = LS;
+         McbspbRegs.DXR1.all = RS;
      }
-     // Case: Record sound into buffer ///////////////////////////////////
-     else if(flag == 1) {
-             LS = McbspbRegs.DRR2.all;
-             RS = McbspbRegs.DRR1.all;
+     else if(flag == 1) {                       // Case: Record sound into buffer
+         LS = McbspbRegs.DRR2.all;
+         RS = McbspbRegs.DRR1.all;
 
-             McbspbRegs.DXR2.all = LS;
-             McbspbRegs.DXR1.all = RS;
-             samp_ready = 1;
-             sptr++;
+         McbspbRegs.DXR2.all = LS;
+         McbspbRegs.DXR1.all = RS;
+         samp_ready = true;
+         sptr++;
      }
-     // Case: Playback sound /////////////////////////////////////////////
-     else if(flag == 3) {
-             throwaway = McbspbRegs.DRR2.all;
-             throwaway = McbspbRegs.DRR1.all;
+     else if(flag == 3) {                       // Case: Playback sound
+         throwaway = McbspbRegs.DRR2.all;
+         throwaway = McbspbRegs.DRR1.all;
 
-             if(play_ready == 0) {
-                 McbspbRegs.DXR2.all = play_samp;
-                 McbspbRegs.DXR1.all = play_samp;
-                 play_ready = 1;
-             }
+         if(!play_ready) {
+             McbspbRegs.DXR2.all = play_samp;
+             McbspbRegs.DXR1.all = play_samp;
+             play_ready = true;
+         }
      }
+     rec_samp = (LS+RS)/2;
      PieCtrlRegs.PIEACK.all = PIEACK_GROUP6;
 }
 
+////////////////////////////////////////////////////////////////
+/* Init AdcA (for left potentiometer) */
 void InitAdca(void) {
     AdcaRegs.ADCCTL2.bit.PRESCALE = 6;
     AdcSetMode(ADC_ADCA, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE);
@@ -430,6 +366,8 @@ void InitAdca(void) {
     AdcaRegs.ADCSOC0CTL.bit.ACQPS = 14;
 }
 
+////////////////////////////////////////////////////////////////
+/* Init AdcB (for right potentiometer) */
 void InitAdcb(void) {
     AdcbRegs.ADCCTL2.bit.PRESCALE = 6;
     AdcSetMode(ADC_ADCB, ADC_RESOLUTION_12BIT, ADC_SIGNALMODE_SINGLE);
@@ -439,6 +377,8 @@ void InitAdcb(void) {
     AdcbRegs.ADCSOC0CTL.bit.ACQPS = 14;
 }
 
+////////////////////////////////////////////////////////////////
+/* Init timer used in ADC poll interrupt */
 void InitTimer1(void) {
     InitCpuTimers();
     ConfigCpuTimer(&CpuTimer1, 200, 400000);
@@ -447,28 +387,29 @@ void InitTimer1(void) {
     CpuTimer1.RegsAddr->TCR.bit.TSS = 0;
 }
 
+////////////////////////////////////////////////////////////////
+/* Init GPIO pins used in IO (as opposed to SRAM usage) */
 void IO_GPIO_Init() {
    EALLOW;
-
    // SW0 -> GPIO0
    GpioCtrlRegs.GPAGMUX1.bit.GPIO0 = 0;
    GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 0;
    GpioCtrlRegs.GPAPUD.bit.GPIO0 = 0;
    GpioCtrlRegs.GPADIR.bit.GPIO0 = 0;
 
-   //SW1 -> GPIO1
+   // SW1 -> GPIO1
    GpioCtrlRegs.GPAGMUX1.bit.GPIO1 = 0;
    GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 0;
    GpioCtrlRegs.GPAPUD.bit.GPIO1 = 0;
    GpioCtrlRegs.GPADIR.bit.GPIO1 = 0;
 
-   //SW2 -> GPIO2
+   // SW2 -> GPIO2
    GpioCtrlRegs.GPAGMUX1.bit.GPIO2 = 0;
    GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 0;
    GpioCtrlRegs.GPAPUD.bit.GPIO2 = 0;
    GpioCtrlRegs.GPADIR.bit.GPIO2 = 0;
 
-   //SW3 -> GPIO3
+   // SW3 -> GPIO3
    GpioCtrlRegs.GPAGMUX1.bit.GPIO2 = 0;
    GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 0;
    GpioCtrlRegs.GPAPUD.bit.GPIO2 = 0;
